@@ -32,7 +32,7 @@ num-integer = "0.1.45"
 # feature or this one
 clear_on_drop = { version = "0.2", features = ["no_cc"] }
 itertools = "0.10.1"
-getrandom = { version = "0.2.3", features = ["js"] }
+getrandom = "0.2.3"
 rand = "0.8.4"
 schemars = "0.8.8"
 serde = { version = "1.0", features = ["derive"] }
@@ -43,10 +43,11 @@ rand_os = "0.1"
 noop_proc_macro = "0.3.0"
 
 # wasm
-[target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies]
-wasm-bindgen = { version = "=0.2.78", features = ["serde-serialize"] }
-rand_os = { version = "0.1", features = ["wasm-bindgen"] }
-js-sys = "=0.3.51"
+# [target.'cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))'.dependencies]
+# wasm-bindgen = { version = "=0.2.78", features = ["serde-serialize"] }
+# rand_os = { version = "0.1", features = ["wasm-bindgen"] }
+# js-sys = "=0.3.51"
+# getrandom = { version = "0.2.3", features = ["js"] }
 
 [profile.release]
 # Tell `rustc` to optimize for small code size.
