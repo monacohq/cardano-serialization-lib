@@ -210,14 +210,14 @@ pub struct TransactionBuilderConfig {
     key_deposit: Coin,                    // protocol parameter
     max_value_size: u32,                  // protocol parameter
     max_tx_size: u32,                     // protocol parameter
-    coins_per_utxo_byte: Coin,            // protocol parameter
+    data_cost: DataCost,                  // protocol parameter
     ex_unit_prices: Option<ExUnitPrices>, // protocol parameter
     prefer_pure_change: bool,
 }
 
 impl TransactionBuilderConfig {
     fn utxo_cost(&self) -> DataCost {
-        DataCost::new_coins_per_byte(&self.coins_per_utxo_byte)
+        self.data_cost.clone()
     }
 }
 
@@ -229,7 +229,7 @@ pub struct TransactionBuilderConfigBuilder {
     key_deposit: Option<Coin>,            // protocol parameter
     max_value_size: Option<u32>,          // protocol parameter
     max_tx_size: Option<u32>,             // protocol parameter
-    coins_per_utxo_byte: Option<Coin>,    // protocol parameter
+    data_cost: Option<DataCost>,          // protocol parameter
     ex_unit_prices: Option<ExUnitPrices>, // protocol parameter
     prefer_pure_change: bool,
 }
@@ -243,7 +243,7 @@ impl TransactionBuilderConfigBuilder {
             key_deposit: None,
             max_value_size: None,
             max_tx_size: None,
-            coins_per_utxo_byte: None,
+            data_cost: None,
             ex_unit_prices: None,
             prefer_pure_change: false,
         }
@@ -262,14 +262,14 @@ impl TransactionBuilderConfigBuilder {
         note = "Since babbage era cardano nodes use coins per byte. Use '.coins_per_utxo_byte' instead."
     )]
     pub fn coins_per_utxo_word(&self, coins_per_utxo_word: &Coin) -> Self {
-        self.coins_per_utxo_byte(
-            &DataCost::new_coins_per_word(coins_per_utxo_word).coins_per_byte(),
-        )
+        let mut cfg = self.clone();
+        cfg.data_cost = Some(DataCost::new_coins_per_word(coins_per_utxo_word));
+        cfg
     }
 
     pub fn coins_per_utxo_byte(&self, coins_per_utxo_byte: &Coin) -> Self {
         let mut cfg = self.clone();
-        cfg.coins_per_utxo_byte = Some(coins_per_utxo_byte.clone());
+        cfg.data_cost = Some(DataCost::new_coins_per_byte(coins_per_utxo_byte));
         cfg
     }
 
@@ -327,8 +327,8 @@ impl TransactionBuilderConfigBuilder {
             max_tx_size: cfg
                 .max_tx_size
                 .ok_or(JsError::from_str("uninitialized field: max_tx_size"))?,
-            coins_per_utxo_byte: cfg.coins_per_utxo_byte.ok_or(JsError::from_str(
-                "uninitialized field: coins_per_utxo_byte",
+            data_cost: cfg.data_cost.ok_or(JsError::from_str(
+                "uninitialized field: coins_per_utxo_byte or coins_per_utxo_word",
             ))?,
             ex_unit_prices: cfg.ex_unit_prices,
             prefer_pure_change: cfg.prefer_pure_change,
@@ -355,7 +355,7 @@ pub struct TransactionBuilder {
     required_signers: Ed25519KeyHashes,
     collateral_return: Option<TransactionOutput>,
     total_collateral: Option<Coin>,
-    reference_inputs: TransactionInputs,
+    reference_inputs: HashSet<TransactionInput>,
 }
 
 #[wasm_bindgen]
@@ -757,7 +757,7 @@ impl TransactionBuilder {
     }
 
     pub fn add_reference_input(&mut self, reference_input: &TransactionInput) {
-        self.reference_inputs.add(reference_input);
+        self.reference_inputs.insert(reference_input.clone());
     }
 
     /// We have to know what kind of inputs these are to know what kind of mock witnesses to create since
@@ -1098,7 +1098,12 @@ impl TransactionBuilder {
             .map(|m| m.get(&policy_id).as_ref().cloned())
             .unwrap_or(None)
             .unwrap_or(MintAssets::new());
-        asset.insert(asset_name, amount);
+        if let Some(mint_amount) = asset.get(asset_name) {
+            let new_amount = mint_amount.0 + amount.0;
+            asset.insert(asset_name, Int(new_amount));
+        } else {
+            asset.insert(asset_name, amount);
+        }
         self._set_mint_asset(&policy_id, policy_script, &asset);
     }
 
@@ -1196,12 +1201,18 @@ impl TransactionBuilder {
             required_signers: Ed25519KeyHashes::new(),
             collateral_return: None,
             total_collateral: None,
-            reference_inputs: TransactionInputs::new(),
+            reference_inputs: HashSet::new(),
         }
     }
 
     pub fn get_reference_inputs(&self) -> TransactionInputs {
-        self.reference_inputs.clone()
+        let mut inputs = self.reference_inputs.clone();
+        for input in self.inputs.get_ref_inputs().0 {
+            inputs.insert(input);
+        }
+
+        let vec_inputs = inputs.into_iter().collect();
+        TransactionInputs(vec_inputs)
     }
 
     /// does not include refunds or withdrawals
@@ -1296,6 +1307,11 @@ impl TransactionBuilder {
 
         let input_total = self.get_total_input()?;
         let output_total = self.get_total_output()?;
+
+        let shortage = get_input_shortage(&input_total, &output_total, &fee)?;
+        if let Some(shortage) = shortage {
+            return Err(JsError::from_str(&format!("Insufficient input in transaction. {}", shortage)));
+        }
 
         use std::cmp::Ordering;
         match &input_total.partial_cmp(&output_total.checked_add(&Value::new(&fee))?) {
@@ -1699,7 +1715,7 @@ impl TransactionBuilder {
             network_id: None,
             collateral_return: self.collateral_return.clone(),
             total_collateral: self.total_collateral.clone(),
-            reference_inputs: self.reference_inputs.to_option(),
+            reference_inputs: self.get_reference_inputs().to_option(),
         };
         // we must build a tx with fake data (of correct size) to check the final Transaction size
         let full_tx = fake_full_tx(self, built)?;
@@ -1844,10 +1860,7 @@ impl TransactionBuilder {
 mod tests {
     use super::output_builder::TransactionOutputBuilder;
     use super::*;
-    use crate::fakes::{
-        fake_base_address, fake_bytes_32, fake_key_hash, fake_tx_hash, fake_tx_input,
-        fake_tx_input2, fake_value, fake_value2,
-    };
+    use crate::fakes::{fake_base_address, fake_bytes_32, fake_key_hash, fake_policy_id, fake_tx_hash, fake_tx_input, fake_tx_input2, fake_value, fake_value2};
     use crate::tx_builder_constants::TxBuilderConstants;
     use fees::*;
 
@@ -2924,6 +2937,196 @@ mod tests {
         );
     }
 
+    #[test]
+    fn change_with_input_and_mint_not_enough_ada() {
+        let mut tx_builder = create_tx_builder_with_fee(&create_linear_fee(1, 1));
+        let spend = root_key_15()
+            .derive(harden(1852))
+            .derive(harden(1815))
+            .derive(harden(0))
+            .derive(0)
+            .derive(0)
+            .to_public();
+        let change_key = root_key_15()
+            .derive(harden(1852))
+            .derive(harden(1815))
+            .derive(harden(0))
+            .derive(1)
+            .derive(0)
+            .to_public();
+        let stake = root_key_15()
+            .derive(harden(1852))
+            .derive(harden(1815))
+            .derive(harden(0))
+            .derive(2)
+            .derive(0)
+            .to_public();
+
+        let spend_cred = StakeCredential::from_keyhash(&spend.to_raw_key().hash());
+        let stake_cred = StakeCredential::from_keyhash(&stake.to_raw_key().hash());
+
+        let (min_script, policy_id) = mint_script_and_policy(0);
+        let asset_name = AssetName::new(vec![0u8, 1, 2, 3]).unwrap();
+
+        let amount_minted = to_bignum(1000);
+        let amount_sent = to_bignum(500);
+        let amount_input_amount = to_bignum(600);
+
+        let mut asset_input = Assets::new();
+        asset_input.insert(&asset_name, &amount_input_amount);
+        let mut mass_input = MultiAsset::new();
+        mass_input.insert(&policy_id, &asset_input);
+
+        // Input with 600 coins
+        tx_builder.add_input(
+            &EnterpriseAddress::new(NetworkInfo::testnet().network_id(), &spend_cred).to_address(),
+            &TransactionInput::new(&genesis_id(), 0),
+            &Value::new(&to_bignum(600)),
+        );
+
+        tx_builder.add_input(
+            &EnterpriseAddress::new(NetworkInfo::testnet().network_id(), &spend_cred).to_address(),
+            &TransactionInput::new(&genesis_id(), 1),
+            &Value::new_with_assets(&to_bignum(1), &mass_input),
+        );
+
+        let addr_net_0 = BaseAddress::new(
+            NetworkInfo::testnet().network_id(),
+            &spend_cred,
+            &stake_cred,
+        ).to_address();
+
+        // Adding mint of the asset - which should work as an input
+        tx_builder.add_mint_asset(&min_script, &asset_name, Int::new(&amount_minted));
+
+        let mut asset = Assets::new();
+        asset.insert(&asset_name, &amount_sent);
+        let mut mass = MultiAsset::new();
+        mass.insert(&policy_id, &asset);
+
+        // One coin and the minted asset goes into the output
+        let mut output_amount = Value::new(&to_bignum(400));
+        output_amount.set_multiasset(&mass);
+
+        tx_builder
+            .add_output(
+                &TransactionOutputBuilder::new()
+                    .with_address(&addr_net_0)
+                    .next()
+                    .unwrap()
+                    .with_value(&output_amount)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let change_cred = StakeCredential::from_keyhash(&change_key.to_raw_key().hash());
+        let change_addr = BaseAddress::new(
+            NetworkInfo::testnet().network_id(),
+            &change_cred,
+            &stake_cred,
+        )
+            .to_address();
+
+        let added_change = tx_builder.add_change_if_needed(&change_addr);
+        assert!(added_change.is_err());
+    }
+
+    #[test]
+    fn change_with_input_and_mint_not_enough_assets() {
+        let mut tx_builder = create_tx_builder_with_fee(&create_linear_fee(1, 1));
+        let spend = root_key_15()
+            .derive(harden(1852))
+            .derive(harden(1815))
+            .derive(harden(0))
+            .derive(0)
+            .derive(0)
+            .to_public();
+        let change_key = root_key_15()
+            .derive(harden(1852))
+            .derive(harden(1815))
+            .derive(harden(0))
+            .derive(1)
+            .derive(0)
+            .to_public();
+        let stake = root_key_15()
+            .derive(harden(1852))
+            .derive(harden(1815))
+            .derive(harden(0))
+            .derive(2)
+            .derive(0)
+            .to_public();
+
+        let spend_cred = StakeCredential::from_keyhash(&spend.to_raw_key().hash());
+        let stake_cred = StakeCredential::from_keyhash(&stake.to_raw_key().hash());
+
+        let (min_script, policy_id) = mint_script_and_policy(0);
+        let asset_name = AssetName::new(vec![0u8, 1, 2, 3]).unwrap();
+
+        let amount_minted = to_bignum(1000);
+        let amount_sent = to_bignum(100000);
+        let amount_input_amount = to_bignum(600);
+
+        let mut asset_input = Assets::new();
+        asset_input.insert(&asset_name, &amount_input_amount);
+        let mut mass_input = MultiAsset::new();
+        mass_input.insert(&policy_id, &asset_input);
+
+        // Input with 600 coins
+        tx_builder.add_input(
+            &EnterpriseAddress::new(NetworkInfo::testnet().network_id(), &spend_cred).to_address(),
+            &TransactionInput::new(&genesis_id(), 0),
+            &Value::new(&to_bignum(100000)),
+        );
+
+        tx_builder.add_input(
+            &EnterpriseAddress::new(NetworkInfo::testnet().network_id(), &spend_cred).to_address(),
+            &TransactionInput::new(&genesis_id(), 1),
+            &Value::new_with_assets(&to_bignum(1), &mass_input),
+        );
+
+        let addr_net_0 = BaseAddress::new(
+            NetworkInfo::testnet().network_id(),
+            &spend_cred,
+            &stake_cred,
+        ).to_address();
+
+        // Adding mint of the asset - which should work as an input
+        tx_builder.add_mint_asset(&min_script, &asset_name, Int::new(&amount_minted));
+
+        let mut asset = Assets::new();
+        asset.insert(&asset_name, &amount_sent);
+        let mut mass = MultiAsset::new();
+        mass.insert(&policy_id, &asset);
+
+        // One coin and the minted asset goes into the output
+        let mut output_amount = Value::new(&to_bignum(400));
+        output_amount.set_multiasset(&mass);
+
+        tx_builder
+            .add_output(
+                &TransactionOutputBuilder::new()
+                    .with_address(&addr_net_0)
+                    .next()
+                    .unwrap()
+                    .with_value(&output_amount)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let change_cred = StakeCredential::from_keyhash(&change_key.to_raw_key().hash());
+        let change_addr = BaseAddress::new(
+            NetworkInfo::testnet().network_id(),
+            &change_cred,
+            &stake_cred,
+        )
+            .to_address();
+
+        let added_change = tx_builder.add_change_if_needed(&change_addr);
+        assert!(added_change.is_err());
+    }
+
     #[ignore]
     #[test]
     fn build_tx_with_native_assets_change() {
@@ -3561,9 +3764,9 @@ mod tests {
 
     fn create_multiasset() -> (MultiAsset, [ScriptHash; 3], [AssetName; 3]) {
         let policy_ids = [
-            PolicyID::from([0u8; 28]),
-            PolicyID::from([1u8; 28]),
-            PolicyID::from([2u8; 28]),
+            fake_policy_id(0),
+            fake_policy_id(1),
+            fake_policy_id(2),
         ];
         let names = [
             AssetName::new(vec![99u8; 32]).unwrap(),
